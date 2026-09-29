@@ -71,4 +71,3 @@ python src/video_analyzer.py --video data/raw/sample.mp4 --out data/output --sam
 - **Luminance & Contrast**: Detects lighting variations, glare, and shadow issues.
 - **Sharpness Profile (Laplacian Variance)**: Evaluates motion blur to ensure staff tag readability.
 - **Frame Contact Sheet**: Automatically generates sampled keyframe grids and identifies high-activity intervals.
-```
