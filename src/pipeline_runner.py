@@ -44,6 +44,8 @@ def parse_arguments(argv=None):
     p.add_argument('--roi', help='JSON file containing normalized polygon vertices; default is whole image')
     p.add_argument('--save-video', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--debug', action='store_true', help='Also write every frame decision and the track audit')
+    p.add_argument('--review-frames', type=int, nargs='+', help='Only export review PNGs around these frame IDs; skip detection')
+    p.add_argument('--review-context', type=int, default=10, help='Frames before/after each review target (default: 10)')
     return p.parse_args(argv)
 
 
@@ -191,6 +193,9 @@ def evidence_sheet(video, frames, audits, out, threshold=.86):
 
 def run_pipeline(argv=None):
     args=parse_arguments(argv)
+    if args.review_frames is not None:
+        from src.review_frames import export_review_sheets
+        return export_review_sheets(args.video,args.review_frames,Path(args.out)/'review',args.review_context)
     start=time.perf_counter()
     cfg=ConsensusConfig(marker_threshold=args.marker_threshold,clear_marker_threshold=args.clear_marker_threshold,
                         propagation_seconds=args.propagation_seconds)
