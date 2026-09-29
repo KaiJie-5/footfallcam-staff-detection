@@ -1,17 +1,18 @@
-# Computer Vision & Video Processing
+# Deep Learning & Object Detection
+torch>=2.1.0
+torchvision>=0.16.0
+ultralytics>=8.1.0
+
+# Computer Vision & Image Processing
 opencv-python>=4.8.0
 pillow>=9.5.0
 
-# Scientific Computing & Data Analysis
+# Data Analysis & Scientific Computing
 numpy>=1.24.0
 scipy>=1.10.0
 pandas>=2.0.0
 
-# Visualization & Reporting
+# Visualization & Progress
 matplotlib>=3.7.0
 seaborn>=0.12.0
 tqdm>=4.65.0
-
-# Deep Learning (Core)
-torch>=2.1.0
-torchvision>=0.16.0
