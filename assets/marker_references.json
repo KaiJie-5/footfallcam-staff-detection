@@ -1,0 +1,35 @@
+{
+  "source": "AI Evaluation Test.pdf, page 1, company-provided reference illustrations",
+  "templates": [
+    {
+      "file": "marker_printed.png",
+      "pdf_image_index": 0,
+      "crop_xyxy": [
+        113,
+        74,
+        150,
+        98
+      ]
+    },
+    {
+      "file": "marker_dark.png",
+      "pdf_image_index": 1,
+      "crop_xyxy": [
+        87,
+        95,
+        111,
+        113
+      ]
+    },
+    {
+      "file": "marker_light.png",
+      "pdf_image_index": 2,
+      "crop_xyxy": [
+        43,
+        105,
+        77,
+        124
+      ]
+    }
+  ]
+}

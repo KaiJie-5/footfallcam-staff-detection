@@ -1,205 +1,103 @@
-"""
-FootfallCam Staff Identification & Tracking Engine (High-Precision Edition)
-Contains:
-1. StaffTagDetector: Forensic visual verification of white staff name tags.
-2. CorridorZoneFilter: Narrowed spatial polygon to strictly isolate the walkway.
-3. OverheadPersonTracker: High-precision YOLOv8x / YOLO11x + ByteTrack at native resolution.
-"""
-
+"""Person detection and association, independent of staff identity."""
+from __future__ import annotations
+import inspect
+from pathlib import Path
+from types import SimpleNamespace
 import cv2
 import numpy as np
-from ultralytics import YOLO
 
 
-class StaffTagDetector:
-    """
-    Detects rectangular white staff name tags on the upper torso/chest region
-    of overhead fisheye person crops.
-    """
-    def __init__(self, min_area=25, max_area=3500, min_wh_ratio=0.35, max_wh_ratio=2.8):
-        self.min_area = min_area
-        self.max_area = max_area
-        self.min_wh_ratio = min_wh_ratio
-        self.max_wh_ratio = max_wh_ratio
-
-    def inspect_crop(self, person_crop):
-        """
-        Inspects person bounding box crop for a staff name tag.
-        Returns:
-            has_tag (bool): True if candidate tag matches badge profile.
-            confidence (float): Metric [0.0 - 1.0].
-            tag_rect (tuple): (x, y, w, h) relative to person crop, or None.
-        """
-        if person_crop is None or person_crop.size == 0:
-            return False, 0.0, None
-
-        h, w = person_crop.shape[:2]
-        if h < 35 or w < 35:
-            return False, 0.0, None
-
-        # Focus on upper torso / chest area (avoid legs/shoes and top of head)
-        y1, y2 = int(h * 0.15), int(h * 0.72)
-        x1, x2 = int(w * 0.18), int(w * 0.82)
-        torso = person_crop[y1:y2, x1:x2]
-
-        if torso.size == 0:
-            return False, 0.0, None
-
-        gray_torso = cv2.cvtColor(torso, cv2.COLOR_BGR2GRAY)
-        
-        # Adapt luminance threshold to ambient torso illumination
-        torso_mean = np.mean(gray_torso)
-        thresh_val = max(175, int(torso_mean + 38))
-        _, white_mask = cv2.threshold(gray_torso, thresh_val, 255, cv2.THRESH_BINARY)
-
-        # Morphological cleanup
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        clean_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
-        clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel)
-
-        # Contour geometry evaluation
-        contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        best_cand = None
-        best_conf = 0.0
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if not (self.min_area <= area <= self.max_area):
-                continue
-
-            bx, by, bw, bh = cv2.boundingRect(cnt)
-            wh_ratio = bw / float(bh)
-
-            if not (self.min_wh_ratio <= wh_ratio <= self.max_wh_ratio):
-                continue
-
-            # Evaluate rectangularity (solidity)
-            rect_area = bw * bh
-            solidity = area / float(rect_area) if rect_area > 0 else 0
-            if solidity < 0.58:
-                continue
-
-            # Contrast evaluation against surrounding fabric
-            pad = 5
-            sy1 = max(0, by - pad)
-            sy2 = min(gray_torso.shape[0], by + bh + pad)
-            sx1 = max(0, bx - pad)
-            sx2 = min(gray_torso.shape[1], bx + bw + pad)
-            
-            tag_pixels = gray_torso[by:by+bh, bx:bx+bw]
-            surrounding_pixels = gray_torso[sy1:sy2, sx1:sx2]
-            
-            tag_lum = np.mean(tag_pixels) if tag_pixels.size > 0 else 0
-            bg_lum = np.mean(surrounding_pixels) if surrounding_pixels.size > 0 else 0
-            contrast_diff = tag_lum - bg_lum
-
-            conf = min(1.0, (tag_lum / 255.0) * 0.55 + max(0, contrast_diff / 75.0) * 0.45)
-
-            if conf > best_conf:
-                best_conf = conf
-                best_cand = (bx + x1, by + y1, bw, bh)
-
-        has_tag = best_conf >= 0.52
-        return has_tag, float(best_conf), best_cand
-
-
-class CorridorZoneFilter:
-    """
-    Defines a narrowed corridor polygon to strictly track the central aisle
-    and eliminate background employees seated at desks.
-    """
-    PRESETS = {
-        # Tight aisle: strictly covers the floor space between desk edges
-        "tight": np.array([
-            [440, 50],   # Top-Left
-            [595, 50],   # Top-Right
-            [615, 710],  # Bottom-Right
-            [455, 710]   # Bottom-Left
-        ], dtype=np.int32),
-        # Ultra-tight aisle: center-line walking track only
-        "ultratight": np.array([
-            [465, 80],
-            [575, 80],
-            [590, 680],
-            [475, 680]
-        ], dtype=np.int32),
-        # Standard: slightly wider tolerance
-        "standard": np.array([
-            [410, 50],
-            [620, 50],
-            [640, 710],
-            [425, 710]
-        ], dtype=np.int32)
-    }
-
-    def __init__(self, preset="tight", custom_polygon=None):
-        if custom_polygon is not None:
-            self.polygon = np.array(custom_polygon, dtype=np.int32)
-        else:
-            self.polygon = self.PRESETS.get(preset, self.PRESETS["tight"])
-
-    def is_inside(self, x, y):
-        """Tests if coordinate (x, y) falls inside the active corridor polygon."""
-        point = (float(x), float(y))
-        return cv2.pointPolygonTest(self.polygon, point, False) >= 0
-
-    def draw_zone(self, image, color=(0, 220, 255), thickness=2):
-        """Draws corridor boundary lines on output visualization."""
-        cv2.polylines(image, [self.polygon], isClosed=True, color=color, thickness=thickness)
-        # Add visual label at top of aisle
-        tx, ty = self.polygon[0][0] + 10, self.polygon[0][1] + 25
-        cv2.putText(image, "CORRIDOR ZONE", (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+def restore_boxes(boxes, rotation, width, height):
+    """Invert np.rot90; xyxy boxes use exclusive right/bottom edges."""
+    boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+    a, b, c, d = boxes.T
+    if rotation == 0:
+        return boxes.copy()
+    if rotation == 90:
+        return np.stack((width-d, a, width-b, c), axis=1)
+    if rotation == 180:
+        return np.stack((width-c, height-d, width-a, height-b), axis=1)
+    if rotation == 270:
+        return np.stack((b, height-c, d, height-a), axis=1)
+    raise ValueError('rotation must be 0, 90, 180 or 270')
 
 
 class OverheadPersonTracker:
-    """
-    High-Precision YOLOv8x / YOLO11x + ByteTrack integration.
-    Operates at native resolution (imgsz=960) to avoid downsampling blur.
-    """
-    def __init__(self, model_weights="yolov8x.pt", device=None, conf_thresh=0.30, imgsz=960):
-        print(f"[INFO] Loading High-Precision Detection Model: {model_weights} (imgsz={imgsz})")
+    """Fuse rotated detections BEFORE one association in source coordinates."""
+    def __init__(self, model_weights='yolov8x.pt', device=None, conf_thresh=0.1,
+                 imgsz=960, fps=25.0, rotations=(0,), buffer_seconds=0.6):
+        from ultralytics import YOLO
+        from ultralytics.trackers.byte_tracker import BYTETracker
+        from ultralytics.engine.results import Boxes
+        from torchvision.ops import nms
+        import torch
+        if not Path(model_weights).is_file():
+            raise FileNotFoundError(f'Model file required: {model_weights}. Download weights explicitly first.')
+        if not 0 < conf_thresh <= 0.1:
+            raise ValueError('conf must be in (0, 0.1] to preserve ByteTrack low-score recovery')
+        if not rotations or any(r not in (0, 90, 180, 270) for r in rotations):
+            raise ValueError('Invalid rotations')
         self.model = YOLO(model_weights)
-        self.device = device
-        self.conf_thresh = conf_thresh
-        self.imgsz = imgsz
+        self.device, self.conf_thresh, self.imgsz = device, conf_thresh, imgsz
+        self.rotations = tuple(dict.fromkeys(rotations))
+        self.Boxes, self.nms, self.torch = Boxes, nms, torch
+        args = SimpleNamespace(track_high_thresh=0.25, track_low_thresh=0.1,
+                               new_track_thresh=0.35, track_buffer=max(1, round(fps*buffer_seconds)),
+                               match_thresh=0.8, fuse_score=True)
+        if 'frame_rate' in inspect.signature(BYTETracker).parameters:
+            self.tracker = BYTETracker(args, frame_rate=30)
+        else:
+            self.tracker = BYTETracker(args)
 
-    def track_frame(self, frame):
-        """
-        Runs high-precision inference and ByteTrack association.
-        """
-        results = self.model.track(
-            source=frame,
-            persist=True,
-            classes=[0],  # Person class only
-            conf=self.conf_thresh,
-            imgsz=self.imgsz,
-            device=self.device,
-            tracker="bytetrack.yaml",
-            verbose=False
-        )
-
+    def track_frame(self, frame, valid=True):
+        h, w = frame.shape[:2]
         detections = []
-        if not results or len(results) == 0:
-            return detections
+        if valid:
+            for angle in self.rotations:
+                rotated = np.ascontiguousarray(np.rot90(frame, angle//90))
+                result = self.model.predict(rotated, classes=[0], conf=self.conf_thresh,
+                                            imgsz=self.imgsz, device=self.device, verbose=False)[0]
+                if len(result.boxes):
+                    data = result.boxes.data.cpu().numpy().copy()
+                    data[:, :4] = restore_boxes(data[:, :4], angle, w, h)
+                    detections.append(data)
+        data = np.concatenate(detections) if detections else np.empty((0, 6), np.float32)
+        if len(data):
+            data[:, [0, 2]] = data[:, [0, 2]].clip(0, w)
+            data[:, [1, 3]] = data[:, [1, 3]].clip(0, h)
+            keep = self.nms(self.torch.from_numpy(data[:, :4].copy()),
+                            self.torch.from_numpy(data[:, 4].copy()), 0.5).numpy()
+            data = data[keep]
+        tracks = self.tracker.update(self.Boxes(data, (h, w)), frame)
+        output = []
+        for track in tracks:
+            raw = data[int(track[-1])]
+            x1, y1 = np.floor(raw[:2]).astype(int)
+            x2, y2 = np.ceil(raw[2:4]).astype(int)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            output.append(dict(track_id=int(track[4]), bbox=[int(x1), int(y1), int(x2), int(y2)],
+                               center=[float((x1+x2)/2), float((y1+y2)/2)], conf=float(raw[4])))
+        return output
 
-        r = results[0]
-        if r.boxes is None or len(r.boxes) == 0:
-            return detections
 
-        boxes = r.boxes.xyxy.cpu().numpy()
-        confs = r.boxes.conf.cpu().numpy()
-        ids = r.boxes.id.cpu().numpy() if r.boxes.id is not None else [-1] * len(boxes)
+class CorridorZoneFilter:
+    """Optional normalized output ROI; never evidence of staff identity."""
+    def __init__(self, polygon=None):
+        self.polygon = None if polygon is None else np.asarray(polygon, dtype=np.float32)
+        if self.polygon is not None:
+            if self.polygon.ndim != 2 or self.polygon.shape[1] != 2 or len(self.polygon) < 3:
+                raise ValueError('ROI must have at least three [x, y] vertices')
+            if not np.isfinite(self.polygon).all() or np.any((self.polygon < 0) | (self.polygon > 1)):
+                raise ValueError('ROI coordinates must be normalized to [0, 1]')
+            if cv2.contourArea(self.polygon) <= 0:
+                raise ValueError('ROI polygon has zero area')
 
-        for bbox, conf, tid in zip(boxes, confs, ids):
-            x1, y1, x2, y2 = map(int, bbox)
-            cx = int((x1 + x2) / 2.0)
-            cy = int((y1 + y2) / 2.0)
-            detections.append({
-                "track_id": int(tid),
-                "bbox": [x1, y1, x2, y2],
-                "center": (cx, cy),
-                "conf": float(conf)
-            })
+    def is_inside(self, x, y, width, height):
+        return self.polygon is None or cv2.pointPolygonTest(self.polygon, (x/width, y/height), False) >= 0
 
-        return detections
+    def draw_zone(self, image):
+        if self.polygon is not None:
+            h, w = image.shape[:2]
+            polygon = np.rint(self.polygon * [w, h]).astype(np.int32)
+            cv2.polylines(image, [polygon], True, (0, 220, 255), 2)

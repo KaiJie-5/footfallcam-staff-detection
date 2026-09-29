@@ -1,276 +1,140 @@
-"""
-FootfallCam AI Evaluation: Video Characteristics & EDA Analyzer
-Analyzes MP4 files for metadata, lighting,
-motion variance, and sharpness before building staff identification pipelines.
-"""
-
-import os
-import cv2
-import json
+"""Video diagnostics. Motion is a quality/activity signal, not staff evidence."""
 import argparse
+import json
+from pathlib import Path
+import sys
+import cv2
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="FootfallCam Video EDA & Characteristic Inspection")
-    parser.add_argument("--video", type=str, required=True, help="Path to input .mp4 file")
-    parser.add_argument("--out", type=str, default="data/output", help="Directory to save analysis results")
-    parser.add_argument("--sample-rate", type=int, default=1, help="Process every Nth frame (default=1 for full analysis)")
-    parser.add_argument("--save-keyframes", action="store_true", default=True, help="Save a contact sheet of keyframes")
-    return parser.parse_args()
-
-
-def get_video_properties(cap):
-    """Extract standard metadata from the OpenCV VideoCapture object."""
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    fps = fps if fps > 0 else 25.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    duration_sec = total_frames / fps if fps else 0
-
-    fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
-    codec = "".join([chr((fourcc >> 8 * i) & 0xFF) for i in range(4)])
-
-    return {
-        "width": width,
-        "height": height,
-        "aspect_ratio": f"{width}:{height}",
-        "native_fps": round(fps, 2),
-        "total_frames": total_frames,
-        "duration_seconds": round(duration_sec, 2),
-        "duration_formatted": f"{int(duration_sec // 60):02d}:{int(duration_sec % 60):02d}",
-        "fourcc_codec": codec
-    }
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.video_io import FrameQuality, open_video
 
 
 def analyze_video_stream(video_path, sample_rate=1):
-    """
-    Scans the video to compute per-frame metrics:
-    - Mean Luminance (brightness)
-    - Contrast (standard deviation of pixel intensities)
-    - Sharpness (variance of the Laplacian)
-    - Inter-frame Motion Difference (Mean Absolute Difference with previous frame)
-    """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise FileNotFoundError(f"Cannot open video file: {video_path}")
-
-    meta = get_video_properties(cap)
-    print(f"\n[INFO] Loaded: {video_path}")
-    print(f"[INFO] Resolution: {meta['width']}x{meta['height']} @ {meta['native_fps']} FPS")
-    print(f"[INFO] Duration: {meta['duration_formatted']} ({meta['total_frames']} frames)")
-
-    records = []
-    prev_gray = None
-    frame_idx = 0
-
-    pbar = tqdm(total=meta['total_frames'], desc="Analyzing frames", unit="frame")
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if frame_idx % sample_rate == 0:
+    if not isinstance(sample_rate, int) or sample_rate < 1:
+        raise ValueError('sample_rate must be a positive integer')
+    cap, meta = open_video(video_path)
+    quality = FrameQuality()
+    rows = []
+    previous, previous_valid = None, False
+    count = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            q = quality.inspect(frame)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-            # 1. Luminance & Contrast
-            mean_brightness = float(np.mean(gray))
-            contrast = float(np.std(gray))
-
-            # 2. Sharpness (Laplacian variance - sensitive to motion blur)
-            sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-            # 3. Inter-frame difference (Motion proxy)
-            if prev_gray is not None:
-                diff = cv2.absdiff(gray, prev_gray)
-                motion_score = float(np.mean(diff))
-            else:
-                motion_score = 0.0
-
-            timestamp_sec = frame_idx / meta['native_fps']
-
-            records.append({
-                "frame_id": frame_idx,
-                "timestamp_sec": round(timestamp_sec, 2),
-                "brightness": round(mean_brightness, 2),
-                "contrast": round(contrast, 2),
-                "sharpness": round(sharpness, 2),
-                "motion_score": round(motion_score, 2)
-            })
-
-            prev_gray = gray
-
-        frame_idx += 1
-        pbar.update(1)
-
-    pbar.close()
-    cap.release()
-
-    df = pd.DataFrame(records)
-    return meta, df
+            motion = None
+            if previous is not None and q['valid'] and previous_valid:
+                delta = gray.astype(np.float32)-previous.astype(np.float32)
+                # Subtract global exposure change before interpreting local change.
+                motion = float(np.mean(np.abs(delta-np.median(delta))))
+            if count % sample_rate == 0:
+                rows.append(dict(frame_id=count, timestamp_sec=count/meta['fps'],
+                                 brightness=q['brightness'], contrast=float(gray.std()),
+                                 sharpness=float(cv2.Laplacian(gray,cv2.CV_64F).var()),
+                                 motion_score=motion, valid=q['valid'], quality_reason=q['reason']))
+            previous, previous_valid = gray, q['valid']
+            count += 1
+    finally:
+        cap.release()
+    if count == 0:
+        raise ValueError('No video frames decoded')
+    if meta['reported_frame_count'] > 0 and count != meta['reported_frame_count']:
+        raise ValueError('Video decoding ended before the reported frame count')
+    meta.update(decoded_frame_count=count, sample_rate=sample_rate, duration_seconds=count/meta['fps'])
+    return meta, pd.DataFrame(rows)
 
 
-def generate_visual_reports(df, meta, out_dir):
-    """Generates time-series inspection plots and a contact sheet."""
-    os.makedirs(out_dir, exist_ok=True)
-
-    fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
-    fig.suptitle(f"Video EDA Report: {meta['width']}x{meta['height']} @ {meta['native_fps']} FPS", fontsize=14, fontweight="bold")
-
-    # Motion Activity
-    axes[0].plot(df["timestamp_sec"], df["motion_score"], color="crimson", linewidth=1.5)
-    axes[0].set_ylabel("Motion Score\n(Frame Diff)")
-    axes[0].grid(True, linestyle="--", alpha=0.6)
-    axes[0].set_title("Motion Activity (Peaks indicate people walking in the aisle)")
-
-    # Sharpness / Blur
-    axes[1].plot(df["timestamp_sec"], df["sharpness"], color="teal", linewidth=1.2)
-    axes[1].set_ylabel("Sharpness\n(Laplacian Var)")
-    axes[1].grid(True, linestyle="--", alpha=0.6)
-    axes[1].set_title("Frame Sharpness (Monitors motion blur)")
-
-    # Brightness
-    axes[2].plot(df["timestamp_sec"], df["brightness"], color="darkorange", linewidth=1.2)
-    axes[2].set_ylabel("Luminance")
-    axes[2].grid(True, linestyle="--", alpha=0.6)
-    axes[2].set_title("Average Brightness Level")
-
-    # Contrast
-    axes[3].plot(df["timestamp_sec"], df["contrast"], color="purple", linewidth=1.2)
-    axes[3].set_ylabel("Contrast (Std)")
-    axes[3].set_xlabel("Time (seconds)")
-    axes[3].grid(True, linestyle="--", alpha=0.6)
-    axes[3].set_title("Pixel Intensity Contrast")
-
-    plt.tight_layout()
-    plot_path = os.path.join(out_dir, "video_eda_metrics.png")
-    plt.savefig(plot_path, dpi=300)
-    plt.close()
-    print(f"[INFO] Saved metrics plot to: {plot_path}")
-
-
-def save_keyframe_contact_sheet(video_path, out_dir, num_samples=16):
-    """Creates a 4x4 grid of representative frames across the video."""
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    indices = np.linspace(0, total_frames - 1, num_samples, dtype=int)
-
-    frames = []
-    for idx in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if ret:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            cv2.putText(frame_rgb, f"Frame {idx}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-            frames.append(frame_rgb)
-    cap.release()
-
-    if not frames:
-        return
-
-    rows, cols = 4, 4
-    fig, axes = plt.subplots(rows, cols, figsize=(16, 12))
-    for i, ax in enumerate(axes.flat):
-        if i < len(frames):
-            ax.imshow(frames[i])
-            ax.axis("off")
-    plt.suptitle("Sample Keyframe Overview (Evenly Distributed Across Video)", fontsize=16)
-    plt.tight_layout()
-    sheet_path = os.path.join(out_dir, "keyframe_contact_sheet.jpg")
-    plt.savefig(sheet_path, dpi=200)
-    plt.close()
-    print(f"[INFO] Saved keyframe contact sheet to: {sheet_path}")
-
-
-def detect_motion_intervals(df, threshold_factor=1.5):
-    """Identifies time intervals where significant movement occurs (people walking)."""
-    baseline = df["motion_score"].median()
-    std = df["motion_score"].std()
-    cutoff = baseline + threshold_factor * std
-
-    active_frames = df[df["motion_score"] > cutoff]
-    if active_frames.empty:
+def detect_motion_intervals(df, threshold_factor=3.0, sample_rate=1):
+    """Robust activity threshold excludes sensor dropouts and NaN comparisons."""
+    scores = df.loc[df['valid'], 'motion_score'].dropna()
+    if scores.empty:
         return []
-
-    # Group consecutive frames into active segments
+    median = float(scores.median())
+    mad = float((scores-median).abs().median())
+    cutoff = median + threshold_factor*max(1.4826*mad,0.1)
     intervals = []
-    start_frame = None
-    last_frame = None
-
-    for f in active_frames["frame_id"]:
-        if start_frame is None:
-            start_frame = f
-            last_frame = f
-        elif f - last_frame <= 5:  # tolerance gap of 5 frames
-            last_frame = f
-        else:
-            intervals.append({"start_frame": int(start_frame), "end_frame": int(last_frame)})
-            start_frame = f
-            last_frame = f
-
-    if start_frame is not None:
-        intervals.append({"start_frame": int(start_frame), "end_frame": int(last_frame)})
-
+    for row in df.itertuples():
+        active = row.valid and pd.notna(row.motion_score) and row.motion_score > cutoff
+        if active:
+            if intervals and row.frame_id-intervals[-1]['end_frame'] <= sample_rate:
+                intervals[-1]['end_frame'] = int(row.frame_id)
+            else:
+                intervals.append(dict(start_frame=int(row.frame_id),end_frame=int(row.frame_id)))
     return intervals
 
 
+def generate_visual_reports(df, meta, out_dir):
+    out = Path(out_dir)
+    out.mkdir(parents=True,exist_ok=True)
+    fig, axes = plt.subplots(4,1,figsize=(12,9),sharex=True)
+    for ax,column in zip(axes,['motion_score','sharpness','brightness','contrast']):
+        ax.plot(df.timestamp_sec,df[column],linewidth=1)
+        ax.set_ylabel(column.replace('_',' '))
+        ax.grid(alpha=.3)
+    axes[-1].set_xlabel('Time (seconds)')
+    fig.suptitle(f'Video diagnostics: {meta["width"]} x {meta["height"]}, {meta["fps"]:g} FPS')
+    fig.tight_layout()
+    fig.savefig(out/'video_eda_metrics.png',dpi=150)
+    plt.close(fig)
+
+
+def save_keyframe_contact_sheet(video_path, out_dir, num_samples=16):
+    if num_samples < 1:
+        raise ValueError('num_samples must be positive')
+    cap, meta = open_video(video_path)
+    if meta['reported_frame_count'] < 1:
+        cap.release()
+        raise ValueError('Cannot seek keyframes without a frame count')
+    count=min(num_samples,meta['reported_frame_count'])
+    indices=np.linspace(0,meta['reported_frame_count']-1,count,dtype=int)
+    cols=min(4,count)
+    fig,axes=plt.subplots(int(np.ceil(count/cols)),cols,figsize=(4*cols,3*np.ceil(count/cols)),squeeze=False)
+    try:
+        for ax in axes.flat:
+            ax.axis('off')
+        for ax,idx in zip(axes.flat,indices):
+            cap.set(cv2.CAP_PROP_POS_FRAMES,int(idx))
+            ok,frame=cap.read()
+            if not ok:
+                raise ValueError(f'Cannot read keyframe {idx}')
+            ax.imshow(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
+            ax.set_title(f'Frame {idx} ({idx/meta["fps"]:.2f}s)')
+        Path(out_dir).mkdir(parents=True,exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(Path(out_dir)/'keyframe_contact_sheet.jpg',dpi=120)
+    finally:
+        cap.release()
+        plt.close(fig)
+
+
 def main():
-    args = parse_args()
-    os.makedirs(args.out, exist_ok=True)
-
-    # 1. Analyze video
-    meta, df = analyze_video_stream(args.video, sample_rate=args.sample_rate)
-
-    # 2. Find high motion intervals (potential staff walking timestamps)
-    active_intervals = detect_motion_intervals(df)
-
-    # 3. Compile summary report
-    summary = {
-        "metadata": meta,
-        "signal_statistics": {
-            "mean_brightness": round(float(df["brightness"].mean()), 2),
-            "std_brightness": round(float(df["brightness"].std()), 2),
-            "mean_sharpness": round(float(df["sharpness"].mean()), 2),
-            "mean_motion_energy": round(float(df["motion_score"].mean()), 2)
-        },
-        "motion_intervals": active_intervals
-    }
-
-    # 4. Save CSV & JSON
-    csv_path = os.path.join(args.out, "frame_metrics.csv")
-    df.to_csv(csv_path, index=False)
-    print(f"[INFO] Saved frame metrics to: {csv_path}")
-
-    json_path = os.path.join(args.out, "video_eda_summary.json")
-    with open(json_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"[INFO] Saved summary report to: {json_path}")
-
-    # 5. Generate Visuals
-    generate_visual_reports(df, meta, args.out)
-
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--video',required=True)
+    p.add_argument('--out',default='data/output/eda')
+    p.add_argument('--sample-rate',type=int,default=1)
+    p.add_argument('--save-keyframes',action=argparse.BooleanOptionalAction,default=True)
+    args=p.parse_args()
+    meta,df=analyze_video_stream(args.video,args.sample_rate)
+    out=Path(args.out)
+    out.mkdir(parents=True,exist_ok=True)
+    df.to_csv(out/'frame_metrics.csv',index=False)
+    summary=dict(metadata=meta,motion_intervals=detect_motion_intervals(df,sample_rate=args.sample_rate),
+                 sampled_invalid_frames=df.loc[~df.valid,'frame_id'].tolist(),
+                 interpretation='Activity and image quality only; neither marker identity nor person count')
+    (out/'video_eda_summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+    generate_visual_reports(df,meta,out)
     if args.save_keyframes:
-        save_keyframe_contact_sheet(args.video, args.out)
-
-    print("\n" + "=" * 50)
-    print("           VIDEO EDA SUMMARY")
-    print("=" * 50)
-    print(f"Dimensions     : {meta['width']}x{meta['height']}")
-    print(f"FPS            : {meta['native_fps']}")
-    print(f"Total Frames   : {meta['total_frames']}")
-    print(f"Total Duration : {meta['duration_formatted']} ({meta['duration_seconds']}s)")
-    print(f"High-Motion Segments Detected: {len(active_intervals)}")
-    for i, interval in enumerate(active_intervals):
-        t_start = interval["start_frame"] / meta["native_fps"]
-        t_end = interval["end_frame"] / meta["native_fps"]
-        print(f"  Segment {i+1}: Frames [{interval['start_frame']} - {interval['end_frame']}] (~{t_start:.1f}s - {t_end:.1f}s)")
-    print("=" * 50)
+        save_keyframe_contact_sheet(args.video,out)
+    print(json.dumps(summary,indent=2))
 
 
-if __name__ == "__main__":
+if __name__=='__main__':
     main()

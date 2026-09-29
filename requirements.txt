@@ -1,18 +1,17 @@
 # Deep Learning & Object Detection
 torch>=2.1.0
 torchvision>=0.16.0
-ultralytics>=8.1.0
+ultralytics==8.4.165
+lap>=0.5.12,<0.6
 
 # Computer Vision & Image Processing
-opencv-python>=4.8.0
+opencv-python>=4.8.0,<6
 pillow>=9.5.0
 
 # Data Analysis & Scientific Computing
-numpy>=1.24.0
+numpy>=1.24.0,<3
 scipy>=1.10.0
 pandas>=2.0.0
 
 # Visualization & Progress
 matplotlib>=3.7.0
-seaborn>=0.12.0
-tqdm>=4.65.0

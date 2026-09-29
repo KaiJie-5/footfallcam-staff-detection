@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.pt
+data/output/
+data/review/
+data/cache/
+.ultralytics/
+*.egg-info/
