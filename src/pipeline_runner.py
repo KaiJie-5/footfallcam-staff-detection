@@ -46,6 +46,9 @@ def parse_arguments(argv=None):
     p.add_argument('--debug', action='store_true', help='Also write every frame decision and the track audit')
     p.add_argument('--review-frames', type=int, nargs='+', help='Only export review PNGs around these frame IDs; skip detection')
     p.add_argument('--review-context', type=int, default=3, help='Frames before/after each review target (default: 3)')
+    p.add_argument('--review-padding', type=float, default=0.10, help='Extra box width/height on each crop side (default: 0.10)')
+    p.add_argument('--review-trajectories', help='Staff CSV for review crops (default: <out>/staff_trajectories.csv)')
+    p.add_argument('--review-track-ids', type=int, nargs='+', help='Optional track ID per target, in the same order as --review-frames')
     return p.parse_args(argv)
 
 
@@ -195,7 +198,9 @@ def run_pipeline(argv=None):
     args=parse_arguments(argv)
     if args.review_frames is not None:
         from src.review_frames import export_review_sheets
-        return export_review_sheets(args.video,args.review_frames,Path(args.out)/'review',args.review_context)
+        return export_review_sheets(args.video,args.review_frames,Path(args.out)/'review',args.review_context,
+                                    trajectories=args.review_trajectories,padding=args.review_padding,
+                                    track_ids=args.review_track_ids)
     start=time.perf_counter()
     cfg=ConsensusConfig(marker_threshold=args.marker_threshold,clear_marker_threshold=args.clear_marker_threshold,
                         propagation_seconds=args.propagation_seconds)
