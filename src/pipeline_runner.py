@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import csv
+from contextlib import nullcontext
 from dataclasses import asdict
 import importlib.metadata
 import json
@@ -22,7 +23,7 @@ from src.video_io import open_video, validate_video_metadata
 ROOT = Path(__file__).resolve().parents[1]
 CSV_FIELDS = ['frame_id', 'timestamp_sec', 'track_id', 'segment_id', 'x', 'y',
               'bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2', 'person_conf',
-              'marker_sampled', 'marker_score', 'position_source']
+              'marker_sampled', 'marker_score', 'position_source', 'classification_source']
 
 
 def parse_arguments(argv=None):
@@ -37,11 +38,12 @@ def parse_arguments(argv=None):
     p.add_argument('--evidence-cache', help='Reuse marker evidence; rebuild after changing inputs or marker settings')
     p.add_argument('--sample-seconds', type=float, default=0.2)
     p.add_argument('--reference-dir', default=str(ROOT/'assets'))
-    p.add_argument('--strong-score', type=float, default=0.9)
-    p.add_argument('--support-score', type=float, default=0.84)
+    p.add_argument('--marker-threshold', type=float, default=0.87, help='Marker match requiring a consistent second view')
+    p.add_argument('--clear-marker-threshold', type=float, default=0.97, help='Clear match that can confirm staff on its own')
     p.add_argument('--propagation-seconds', type=float, default=3.0)
     p.add_argument('--roi', help='JSON file containing normalized polygon vertices; default is whole image')
     p.add_argument('--save-video', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--debug', action='store_true', help='Also write every frame decision and the track audit')
     return p.parse_args(argv)
 
 
@@ -66,9 +68,10 @@ def load_evidence(path, video):
     return frames, meta
 
 
-def export_results(frames, meta, out, roi):
+def export_results(frames, meta, out, roi, debug=False):
     staff_frames, rows = [], []
-    with (out/'frame_decisions.jsonl').open('w', encoding='utf-8') as decisions:
+    log = (out/'frame_decisions.jsonl').open('w', encoding='utf-8') if debug else nullcontext()
+    with log as decisions:
         for item in frames:
             fid = item['frame_id']
             exported = []
@@ -82,11 +85,13 @@ def export_results(frames, meta, out, roi):
                 rows.append(dict(frame_id=fid, timestamp_sec=fid/meta['fps'], track_id=d['track_id'],
                                  segment_id=d['segment_id'], x=x, y=y, bbox_x1=a, bbox_y1=b, bbox_x2=c, bbox_y2=e,
                                  person_conf=d['conf'], marker_sampled=badge is not None,
-                                 marker_score='' if badge is None else badge['score'], position_source='observed_box_center'))
+                                 marker_score='' if badge is None else badge['score'], position_source='observed_box_center',
+                                 classification_source=d['classification_source']))
                 exported.append(d['segment_id'])
             if exported:
                 staff_frames.append(fid)
-            decisions.write(json.dumps(dict(**item, staff_present=bool(exported), staff_segment_ids=exported))+'\n')
+            if decisions is not None:
+                decisions.write(json.dumps(dict(**item, staff_present=bool(exported), staff_segment_ids=exported))+'\n')
     with (out/'staff_trajectories.csv').open('w', newline='', encoding='utf-8') as stream:
         writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS)
         writer.writeheader()
@@ -97,7 +102,7 @@ def export_results(frames, meta, out, roi):
     return task1, rows
 
 
-def render_video(video, out, frames, meta, roi):
+def render_video(video, out, frames, meta, roi, support_score=0.82):
     path = out/'annotated_output.mp4'
     if path.resolve() == Path(video).resolve():
         raise ValueError('Annotated output must not overwrite the input video')
@@ -122,10 +127,13 @@ def render_video(video, out, frames, meta, roi):
                 present |= staff
                 color = (40,220,40) if staff else ((0,180,255) if d['status']=='candidate' else (130,130,130))
                 cv2.rectangle(frame,(a,b),(c,e),color,2 if staff else 1)
-                label = f'{d["status"]} T{d["track_id"]}/S{d["segment_id"]}'
+                state = d['status']
+                if staff:
+                    state += ' (marker)' if d['classification_source'] == 'marker' else ' (tracked)'
+                label = f'{state} T{d["track_id"]}/S{d["segment_id"]}'
                 cv2.putText(frame,label,(a,max(15,b-5)),0,.43,color,1)
                 badge=d.get('badge')
-                if badge and badge['bbox'] and badge['score'] >= .84:
+                if badge and badge['bbox'] and badge['score'] >= support_score:
                     x,y,x2,y2=badge['bbox']
                     cv2.rectangle(frame,(x,y),(x2,y2),(0,0,255),1)
                 if staff:
@@ -167,12 +175,14 @@ def evidence_sheet(video, frames, audits, out, threshold=.86):
             crop=f[y:y2,x:x2].copy()
             bx,by,bx2,by2=b['bbox']
             cv2.rectangle(crop,(bx-x,by-y),(bx2-x,by2-y),(0,0,255),1)
-            scale=min(190/crop.shape[1],175/crop.shape[0])
+            scale=min(190/crop.shape[1],160/crop.shape[0])
             crop=cv2.resize(crop,None,fx=scale,fy=scale)
             py,px=i//6*240,i%6*200
-            sheet[py+55:py+55+crop.shape[0],px:px+crop.shape[1]]=crop
+            sheet[py+70:py+70+crop.shape[0],px:px+crop.shape[1]]=crop
             cv2.putText(sheet,f'S{a["segment_id"]} T{a["track_id"]} f{b["frame_id"]}',(px+3,py+18),0,.42,(255,255,255),1)
-            cv2.putText(sheet,f'{b["score"]:.3f} | staff={bool(a["staff_frames"])}',(px+3,py+38),0,.42,(255,255,255),1)
+            cv2.putText(sheet,f'{b["score"]:.3f} | {d["status"]}',(px+3,py+38),0,.42,(255,255,255),1)
+            rule=d['reason']
+            cv2.putText(sheet,rule,(px+3,py+56),0,.33,(255,255,255),1)
     finally:
         cap.release()
     if not cv2.imwrite(str(out/'marker_evidence.jpg'),sheet):
@@ -182,7 +192,7 @@ def evidence_sheet(video, frames, audits, out, threshold=.86):
 def run_pipeline(argv=None):
     args=parse_arguments(argv)
     start=time.perf_counter()
-    cfg=ConsensusConfig(strong_score=args.strong_score,support_score=args.support_score,
+    cfg=ConsensusConfig(marker_threshold=args.marker_threshold,clear_marker_threshold=args.clear_marker_threshold,
                         propagation_seconds=args.propagation_seconds)
     if not math.isfinite(args.sample_seconds) or args.sample_seconds <= 0 or args.imgsz < 32:
         raise ValueError('sample-seconds must be positive and imgsz at least 32')
@@ -196,23 +206,25 @@ def run_pipeline(argv=None):
         people=args.people_cache
         if people is None:
             from scripts.cache_people import cache_people
-            people=out/'people.jsonl'
+            people=out/'cache'/'people.jsonl'
             cache_people(args.video,args.weights,people,args.device,args.imgsz,args.rotations)
-        evidence=out/'evidence.jsonl'
+        evidence=out/'cache'/'evidence.jsonl'
         collect_evidence(args.video,people,evidence,args.sample_seconds,args.reference_dir)
     frames,meta=load_evidence(evidence,args.video)
     audits=classify_tracks(frames,meta['fps'],cfg)
-    task1,rows=export_results(frames,meta,out,roi)
-    (out/'track_audit.json').write_text(json.dumps(audits,indent=2),encoding='utf-8')
+    task1,rows=export_results(frames,meta,out,roi,args.debug)
+    if args.debug:
+        (out/'track_audit.json').write_text(json.dumps(audits,indent=2),encoding='utf-8')
     evidence_sheet(args.video,frames,audits,out)
     if args.save_video:
-        render_video(args.video,out,frames,meta,roi)
-    summary=dict(schema_version=2,task_1_staff_frame_count=len(task1['frames']),
+        render_video(args.video,out,frames,meta,roi,cfg.support_threshold)
+    summary=dict(schema_version=3,task_1_staff_frame_count=len(task1['frames']),
                  task_1_frame_ranges=task1['frame_ranges'],task_2_trajectory_points=len(rows),
                  identified_staff_track_ids=sorted({r['track_id'] for r in rows}),
                  staff_segment_ids=sorted({r['segment_id'] for r in rows}),
                  invalid_frame_ranges=compress_frame_ranges([f['frame_id'] for f in frames if not f['quality']['valid']]),
                  video=meta,consensus=asdict(cfg),roi=None if roi.polygon is None else roi.polygon.tolist(),
+                 confirmation_policy='one clear marker, or two nearby matches moving with the person',
                  coordinate_system='source image pixels, top-left origin, bounding-box center; not calibrated floor coordinates',
                  mode='offline; future marker evidence can support earlier observations within propagation_seconds',
                  uncertainty='No confirmed evidence is not proof of absence. Missing detections are not interpolated.',

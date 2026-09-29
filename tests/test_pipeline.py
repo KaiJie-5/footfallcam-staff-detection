@@ -40,7 +40,7 @@ def test_five_scattered_hits_do_not_label_a_long_track():
 
 
 def test_stationary_staff_is_allowed_and_propagation_is_bounded():
-    frames=make_frames(200,{50:.96,55:.86,60:.96})
+    frames=make_frames(200,{50:.99,55:.86,60:.99})
     classify_tracks(frames,25)
     assert frames[50]['detections'][0]['status']=='staff'
     assert frames[135]['detections'][0]['status']=='staff'
@@ -48,7 +48,7 @@ def test_stationary_staff_is_allowed_and_propagation_is_bounded():
 
 
 def test_blackout_breaks_identity_evidence():
-    frames=make_frames(40,{0:.96,5:.86,10:.96},invalid={15})
+    frames=make_frames(40,{0:.99,5:.86,10:.99},invalid={15})
     classify_tracks(frames,25)
     assert frames[10]['detections'][0]['status']=='staff'
     assert frames[15]['detections'][0]['status']=='unknown'
@@ -56,14 +56,14 @@ def test_blackout_breaks_identity_evidence():
 
 
 def test_large_track_gap_does_not_transfer_staff_label():
-    frames=make_frames(50,{0:.96,5:.86,10:.96},missing=set(range(15,30)))
+    frames=make_frames(50,{0:.99,5:.86,10:.99},missing=set(range(15,30)))
     classify_tracks(frames,25)
     assert frames[30]['detections'][0]['status']=='unknown'
     assert frames[0]['detections'][0]['segment_id']!=frames[30]['detections'][0]['segment_id']
 
 
 def test_no_fabricated_coordinates_in_missing_frames(tmp_path):
-    frames=make_frames(20,{0:.96,5:.86,10:.96},missing={6,7})
+    frames=make_frames(20,{0:.99,5:.86,10:.99},missing={6,7})
     classify_tracks(frames,25)
     task1,rows=export_results(frames,dict(width=200,height=240,fps=25),tmp_path,CorridorZoneFilter())
     assert 6 not in task1['frames'] and 7 not in task1['frames']
@@ -143,4 +143,4 @@ def test_reference_marker_is_found_after_rotation(marker_detector):
 
 def test_consensus_rejects_invalid_thresholds():
     with pytest.raises(ValueError):
-        ConsensusConfig(strong_score=.7,support_score=.9)
+        ConsensusConfig(marker_threshold=.98,clear_marker_threshold=.90)
