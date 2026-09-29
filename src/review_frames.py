@@ -14,7 +14,7 @@ if __package__ in (None, ''):
 from src.video_io import open_video
 
 
-def export_review_sheets(video, targets, out, context=10):
+def export_review_sheets(video, targets, out, context=3):
     """Export one 300-DPI PNG per target, with full frames and a highlighted target.
 
     Frame IDs are zero-based, matching staff_trajectories.csv. Decode in source
@@ -54,23 +54,25 @@ def export_review_sheets(video, targets, out, context=10):
     count = 2*context+1
     columns = min(7, count)
     rows = math.ceil(count/columns)
-    # Each image area is at least its native pixel size. The default 960x720
-    # source produces an 8400x3264 sheet for 21 frames (7 columns x 3 rows).
+    # Size panels for native-resolution frames. Keep header spacing in inches
+    # so the title, subtitle and frame labels also fit on a single-row sheet.
     dpi = 300
     panel_width = max(4.0, meta['width']/(dpi*0.9))
     panel_height = panel_width*meta['height']/meta['width']+0.36
+    figure_height = rows*panel_height+1.0
     paths = []
     for target in targets:
         start, end = target-context, target+context
         fig, axes = plt.subplots(rows, columns, squeeze=False,
-                                 figsize=(columns*panel_width, rows*panel_height+0.8), dpi=dpi)
+                                 figsize=(columns*panel_width, figure_height), dpi=dpi)
         try:
             fig.patch.set_facecolor('white')
-            fig.suptitle(f'Frame-by-frame review | Target frame {target}', fontsize=22, fontweight='bold', y=0.987)
-            fig.text(0.5, 0.944,
+            fig.suptitle(f'Frame-by-frame review | Target frame {target}', fontsize=22, fontweight='bold',
+                         y=1-0.08/figure_height)
+            fig.text(0.5, 1-0.48/figure_height,
                      f'Frames {start}-{end} inclusive | {count} consecutive frames | '
                      f'{meta["fps"]:g} FPS | Original {meta["width"]} x {meta["height"]} pixels | Zero-based frame IDs',
-                     ha='center', fontsize=12, color='#444444')
+                     ha='center', va='top', fontsize=12, color='#444444')
             for ax in axes.flat:
                 ax.set_axis_off()
             for ax, frame_id in zip(axes.flat, range(start, end+1)):
@@ -87,7 +89,8 @@ def export_review_sheets(video, targets, out, context=10):
                     spine.set_visible(True)
                     spine.set_edgecolor('#e87900' if is_target else '#bbbbbb')
                     spine.set_linewidth(3.5 if is_target else 0.6)
-            fig.subplots_adjust(left=0.012, right=0.988, bottom=0.015, top=0.9, wspace=0.045, hspace=0.16)
+            fig.subplots_adjust(left=0.012, right=0.988, bottom=0.015,
+                                top=1-1.0/figure_height, wspace=0.045, hspace=0.16)
             path = out/f'review_frame_{target:06d}.png'
             fig.savefig(path, dpi=dpi, facecolor='white',
                         metadata={'Title': f'Frame {target}: consecutive frames {start}-{end}',
@@ -104,7 +107,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--video', default='data/raw/sample.mp4')
     parser.add_argument('--frames', type=int, nargs='+', required=True, help='Target frame IDs, zero-based')
-    parser.add_argument('--context', type=int, default=10, help='Number of consecutive frames on each side')
+    parser.add_argument('--context', type=int, default=3, help='Number of consecutive frames on each side (default: 3)')
     parser.add_argument('--out', default='data/output/refined/review')
     args = parser.parse_args()
     export_review_sheets(args.video, args.frames, args.out, args.context)

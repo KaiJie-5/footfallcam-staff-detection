@@ -45,7 +45,7 @@ def parse_arguments(argv=None):
     p.add_argument('--save-video', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--debug', action='store_true', help='Also write every frame decision and the track audit')
     p.add_argument('--review-frames', type=int, nargs='+', help='Only export review PNGs around these frame IDs; skip detection')
-    p.add_argument('--review-context', type=int, default=10, help='Frames before/after each review target (default: 10)')
+    p.add_argument('--review-context', type=int, default=3, help='Frames before/after each review target (default: 3)')
     return p.parse_args(argv)
 
 
